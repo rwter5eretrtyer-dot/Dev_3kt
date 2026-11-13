@@ -1,8 +1,0 @@
----
-# Переменные для узлов группы prometheus.
-prometheus_version: "2.53.2"
-prometheus_architecture: "amd64"
-prometheus_listen_address: "0.0.0.0:9090"
-# При желании впишите хеш SHA256 с официальной страницы релиза.
-# Пустое значение отключает автоматическую проверку checksum в get_url.
-prometheus_sha256: ""
