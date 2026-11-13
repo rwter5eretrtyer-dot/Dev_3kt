@@ -1,0 +1,164 @@
+---
+- name: "КТ-3. Установка и настройка Prometheus"
+  hosts: prometheus
+  become: true
+  gather_facts: true
+
+  vars:
+    prometheus_archive: "prometheus-{{ prometheus_version }}.linux-{{ prometheus_architecture }}.tar.gz"
+    prometheus_release_dir: "/tmp/prometheus-{{ prometheus_version }}.linux-{{ prometheus_architecture }}"
+
+  pre_tasks:
+    # Проверяем тип ОС и архитектуру целевой виртуальной машины.
+    - name: "Проверить совместимость целевой системы"
+      ansible.builtin.assert:
+        that:
+          - ansible_os_family == 'Debian'
+          - ansible_architecture in ['x86_64', 'amd64']
+        fail_msg: "Нужна Ubuntu/Debian с архитектурой x86_64."
+
+    # Если указан SHA256, убеждаемся в его правильном формате.
+    - name: "Проверить формат SHA256 при его указании"
+      ansible.builtin.assert:
+        that:
+          - (prometheus_sha256 | length) == 0 or prometheus_sha256 is match('^[0-9a-fA-F]{64}$')
+        fail_msg: "prometheus_sha256 должен быть пустым или содержать 64 hex-символа."
+
+  tasks:
+    # 1. Обновляем apt и устанавливаем необходимые инструменты.
+    - name: "Обновить индекс apt и установить зависимости"
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - tar
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    # 2. Создаем системную группу и пользователя без интерактивного входа.
+    - name: "Создать системную группу prometheus"
+      ansible.builtin.group:
+        name: prometheus
+        system: true
+        state: present
+
+    - name: "Создать пользователя prometheus"
+      ansible.builtin.user:
+        name: prometheus
+        group: prometheus
+        system: true
+        shell: /usr/sbin/nologin
+        create_home: false
+        state: present
+
+    # 3. Создаем раздельные каталоги конфигурации и метрик.
+    - name: "Создать каталог конфигурации"
+      ansible.builtin.file:
+        path: /etc/prometheus
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: "Создать каталог хранения метрик"
+      ansible.builtin.file:
+        path: /var/lib/prometheus
+        state: directory
+        owner: prometheus
+        group: prometheus
+        mode: '0750'
+
+    # 4. Загружаем официальный архив с релизом, заданным переменными.
+    - name: "Скачать Prometheus с GitHub Releases"
+      ansible.builtin.get_url:
+        url: "https://github.com/prometheus/prometheus/releases/download/v{{ prometheus_version }}/{{ prometheus_archive }}"
+        dest: "/tmp/{{ prometheus_archive }}"
+        mode: '0644'
+        checksum: "{{ ('sha256:' ~ prometheus_sha256) if (prometheus_sha256 | length == 64) else omit }}"
+
+    # 5. Распаковываем скачанный архив на целевом сервере.
+    - name: "Распаковать Prometheus"
+      ansible.builtin.unarchive:
+        src: "/tmp/{{ prometheus_archive }}"
+        dest: /tmp
+        remote_src: true
+        creates: "{{ prometheus_release_dir }}/prometheus"
+
+    # 6. Копируем бинарные файлы; владельцем оставляем root.
+    - name: "Установить исполняемые файлы prometheus и promtool"
+      ansible.builtin.copy:
+        src: "{{ prometheus_release_dir }}/{{ item }}"
+        dest: "/usr/local/bin/{{ item }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: '0755'
+      loop:
+        - prometheus
+        - promtool
+      notify: Restart Prometheus
+
+    # 7. Устанавливаем каталоги веб-консолей из дистрибутива.
+    - name: "Скопировать консольные шаблоны Prometheus"
+      ansible.builtin.copy:
+        src: "{{ prometheus_release_dir }}/{{ item }}/"
+        dest: "/etc/prometheus/{{ item }}/"
+        remote_src: true
+        owner: root
+        group: root
+        mode: preserve
+      loop:
+        - consoles
+        - console_libraries
+
+    # 8. Создаем рабочую конфигурацию с самоконтролем метрик.
+    - name: "Создать и проверить конфигурацию Prometheus"
+      ansible.builtin.template:
+        src: prometheus.yml.j2
+        dest: /etc/prometheus/prometheus.yml
+        owner: root
+        group: root
+        mode: '0644'
+        validate: '/usr/local/bin/promtool check config %s'
+      notify: Restart Prometheus
+
+    # 9. Создаем unit для запуска службы через systemd.
+    - name: "Создать службу systemd"
+      ansible.builtin.template:
+        src: prometheus.service.j2
+        dest: /etc/systemd/system/prometheus.service
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Restart Prometheus
+
+    # 10. Обновляем systemd, включаем автозагрузку и запускаем службу.
+    - name: "Включить и запустить службу prometheus"
+      ansible.builtin.systemd_service:
+        name: prometheus
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    # 11. Применяем отложенные перезапуски до проверки HTTP.
+    - name: "Применить изменения службы"
+      ansible.builtin.meta: flush_handlers
+
+    # 12. Проверяем готовность веб-интерфейса изнутри сервера.
+    - name: "Убедиться в готовности Prometheus на порту 9090"
+      ansible.builtin.uri:
+        url: http://127.0.0.1:9090/-/ready
+        method: GET
+        status_code: 200
+      register: prometheus_ready
+      retries: 12
+      delay: 5
+      until: prometheus_ready.status == 200
+
+  handlers:
+    - name: Restart Prometheus
+      ansible.builtin.systemd_service:
+        name: prometheus
+        daemon_reload: true
+        state: restarted

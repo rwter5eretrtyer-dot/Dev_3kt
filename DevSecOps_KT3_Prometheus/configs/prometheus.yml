@@ -1,0 +1,10 @@
+# КТ-3. Базовая конфигурация Prometheus для сбора собственных метрик.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# Prometheus обращается к собственному endpoint /metrics.
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["127.0.0.1:9090"]
